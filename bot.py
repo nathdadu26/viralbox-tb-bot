@@ -35,9 +35,12 @@ logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TERABOX_API = os.getenv("TERABOX_API", "")
 
-# MongoDB Configuration
+# MongoDB Configuration (only for file info)
 MONGO_URI = os.getenv("MONGO_URI", "")
 DB_NAME = os.getenv("DB_NAME", "viralbox_db")
+
+# Worker Database API
+WORKER_DB_API = os.getenv("WORKER_DB_API", "https://database.ftolbots.workers.dev")
 
 # Channels
 TELEGRAM_CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", ""))
@@ -72,26 +75,20 @@ API_TIMEOUT = int(os.getenv("API_TIMEOUT", "120"))
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required!")
 
-# --- MongoDB Database Setup ---
+# --- MongoDB Database Setup (Only for file info) ---
 mongo_client = None
 db = None
 files_collection = None
-mappings_collection = None
 
 async def init_db():
-    global mongo_client, db, files_collection, mappings_collection
+    global mongo_client, db, files_collection
     try:
         mongo_client = AsyncIOMotorClient(MONGO_URI)
         db = mongo_client[DB_NAME]
         files_collection = db["terabox_file_name"]
-        mappings_collection = db["mappings"]
         
-        # Create indexes for better performance
+        # Create index for file names
         await files_collection.create_index("file_name", unique=True)
-        
-        # Create index for mappings
-        await mappings_collection.create_index("mapping", unique=True)
-        await mappings_collection.create_index("message_id")
         
         logger.info("✅ MongoDB connected successfully")
     except Exception as e:
@@ -99,6 +96,7 @@ async def init_db():
         raise
 
 async def is_file_processed(file_name: str) -> bool:
+    """Check if file already processed (MongoDB)"""
     try:
         result = await files_collection.find_one({"file_name": file_name})
         return result is not None
@@ -107,16 +105,18 @@ async def is_file_processed(file_name: str) -> bool:
         return False
 
 async def save_file_info(file_name: str, file_size: str):
+    """Save only file name and size to MongoDB"""
     try:
         document = {
             "file_name": file_name,
             "file_size": file_size
         }
         await files_collection.insert_one(document)
-        logger.info(f"✅ Saved to DB: {file_name}")
+        logger.info(f"✅ Saved to MongoDB: {file_name}")
     except Exception as e:
-        logger.warning(f"Failed to save to DB (might be duplicate): {e}")
+        logger.warning(f"Failed to save to MongoDB (might be duplicate): {e}")
 
+# --- Worker API Functions for Mapping ---
 import random
 import string
 
@@ -125,26 +125,49 @@ def generate_random_mapping(length: int = 6) -> str:
     chars = string.ascii_letters + string.digits
     return ''.join(random.choice(chars) for _ in range(length))
 
-async def save_mapping(message_id: int) -> str:
-    """Save message_id with random mapping and return the mapping"""
-    max_attempts = 10
-    for attempt in range(max_attempts):
+async def save_mapping_to_worker_api(message_id: int, session: aiohttp.ClientSession, max_retries: int = 3) -> Optional[str]:
+    """Save message_id with random mapping to Worker API"""
+    for attempt in range(max_retries):
         try:
+            # Generate random mapping
             mapping = generate_random_mapping()
-            document = {
-                "mapping": mapping,
-                "message_id": message_id
+            
+            # Prepare data for Worker API
+            data = {
+                "message_id": str(message_id),
+                "value": mapping
             }
-            await mappings_collection.insert_one(document)
-            logger.info(f"✅ Saved mapping: {mapping} -> {message_id}")
-            return mapping
+            
+            # POST to Worker API
+            async with session.post(
+                f"{WORKER_DB_API}/add",
+                json=data,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    logger.info(f"✅ Saved to Worker API: {mapping} -> {message_id}")
+                    return mapping
+                elif response.status == 409:  # Conflict - duplicate mapping
+                    logger.warning(f"⚠️ Duplicate mapping, retrying... ({attempt + 1}/{max_retries})")
+                    continue
+                else:
+                    logger.error(f"❌ Worker API error: {response.status}")
+                    if attempt == max_retries - 1:
+                        return None
+                    
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱️ Worker API timeout ({attempt + 1}/{max_retries})")
+            if attempt == max_retries - 1:
+                return None
         except Exception as e:
-            if attempt == max_attempts - 1:
-                logger.error(f"Failed to save mapping after {max_attempts} attempts: {e}")
-                raise
-            # Duplicate mapping, try again
-            continue
-    raise Exception("Failed to generate unique mapping")
+            logger.error(f"❌ Worker API error: {e}")
+            if attempt == max_retries - 1:
+                return None
+        
+        await asyncio.sleep(1)
+    
+    return None
 
 # ---------------- Aria2Client ----------------
 class Aria2Client:
@@ -499,11 +522,17 @@ async def process_single_link(url: str, link_number: int, total_links: int,
         
         logger.info(f"✅ Uploaded - Msg ID: {message_id}")
 
-        # Step 4: Save to DB (only file_name and file_size)
+        # Step 4: Save to MongoDB (only file_name and file_size)
         await save_file_info(original_file_name, file_size_str)
 
-        # Generate mapping and save to DB
-        mapping = await save_mapping(message_id)
+        # Step 5: Save mapping to Worker API
+        await bot_instance.init_session()
+        mapping = await save_mapping_to_worker_api(message_id, bot_instance.session)
+        
+        if not mapping:
+            logger.error(f"❌ Failed to save mapping to Worker API")
+            error_msg = f"❌ Failed to save mapping"
+            return False, None, error_msg
         
         # Build worker URL
         worker_url = f"{WORKER_URL_BASE}/{mapping}"
@@ -718,7 +747,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• One-by-one processing (no overload)\n"
         f"• Global queue system\n"
         f"• Automatic file renaming with watermark\n"
-        f"• MongoDB storage for duplicate detection\n"
+        f"• MongoDB storage for file info\n"
+        f"• Worker API for message mappings\n"
         f"• Flood wait handling\n\n"
         f"📋 <b>How to use:</b>\n"
         f"Send media (photo/video/document) with Terabox links in caption.\n\n"
@@ -799,6 +829,7 @@ async def start_webhook_server():
     logger.info(f"📢 Telegram Channel: {TELEGRAM_CHANNEL_ID}")
     logger.info(f"📊 Result Channel: {RESULT_CHANNEL_ID}")
     logger.info(f"🏷️ Watermark: {CHANNEL_USERNAME}")
+    logger.info(f"🔗 Worker DB API: {WORKER_DB_API}")
     logger.info(f"📋 Global queue system active")
 
     # Keep the server running
@@ -834,6 +865,7 @@ def main():
             logger.info("🚀 Bot started in polling mode")
             logger.info(f"📢 Telegram Channel: {TELEGRAM_CHANNEL_ID}")
             logger.info(f"📊 Result Channel: {RESULT_CHANNEL_ID}")
+            logger.info(f"🔗 Worker DB API: {WORKER_DB_API}")
             logger.info(f"📋 Global queue system active")
             
             await app.run_polling()
