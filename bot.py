@@ -90,12 +90,16 @@ pyrogram_client = None
 async def init_pyrogram():
     global pyrogram_client
     try:
+        # Use /tmp for session file (writable directory)
+        session_path = "/tmp/pyrogram_session"
+        os.makedirs(session_path, exist_ok=True)
+        
         pyrogram_client = Client(
             "terabox_bot",
             api_id=API_ID,
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
-            workdir="./pyrogram_session"
+            workdir=session_path
         )
         await pyrogram_client.start()
         logger.info("✅ Pyrogram client started successfully")
