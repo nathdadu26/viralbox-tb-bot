@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime
+from pyrogram import Client
+from pyrogram.errors import FloodWait
 
 # Load environment variables from .env file
 load_dotenv()
@@ -30,24 +32,26 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 # Config from environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TERABOX_API = os.getenv("TERABOX_API", "")
 
-# MongoDB Configuration (only for file info)
+# Pyrogram API credentials
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+
+# MongoDB Configuration
 MONGO_URI = os.getenv("MONGO_URI", "")
 DB_NAME = os.getenv("DB_NAME", "viralbox_db")
-
-# Worker Database API
-WORKER_DB_API = os.getenv("WORKER_DB_API", "https://database.ftolbots.workers.dev")
 
 # Channels
 TELEGRAM_CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", ""))
 RESULT_CHANNEL_ID = int(os.getenv("RESULT_CHANNEL_ID", ""))
 
 # Worker URL Base
-WORKER_URL_BASE = os.getenv("WORKER_URL_BASE", "https://file.ftolbots.workers.dev")
+WORKER_URL_BASE = os.getenv("WORKER_URL_BASE", "https://file.hivezone69.workers.dev")
 
 # Channel Username for Watermark
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@AtoZ_hub")
@@ -71,24 +75,60 @@ TERABOX_DOMAINS = [
 # API timeout - increased for slow Terabox API
 API_TIMEOUT = int(os.getenv("API_TIMEOUT", "120"))
 
+# File size limit (2GB for Pyrogram)
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "2000"))  # 2GB default
+
 # Validate required environment variables
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required!")
+if not API_ID or not API_HASH:
+    raise ValueError("API_ID and API_HASH are required for Pyrogram!")
 
-# --- MongoDB Database Setup (Only for file info) ---
+# --- Pyrogram Client Setup ---
+pyrogram_client = None
+
+async def init_pyrogram():
+    global pyrogram_client
+    try:
+        pyrogram_client = Client(
+            "terabox_bot",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            bot_token=BOT_TOKEN,
+            workdir="./pyrogram_session"
+        )
+        await pyrogram_client.start()
+        logger.info("✅ Pyrogram client started successfully")
+    except Exception as e:
+        logger.error(f"❌ Pyrogram client failed to start: {e}")
+        raise
+
+async def stop_pyrogram():
+    global pyrogram_client
+    if pyrogram_client:
+        await pyrogram_client.stop()
+        logger.info("🛑 Pyrogram client stopped")
+
+# --- MongoDB Database Setup ---
 mongo_client = None
 db = None
 files_collection = None
+mappings_collection = None
 
 async def init_db():
-    global mongo_client, db, files_collection
+    global mongo_client, db, files_collection, mappings_collection
     try:
         mongo_client = AsyncIOMotorClient(MONGO_URI)
         db = mongo_client[DB_NAME]
         files_collection = db["terabox_file_name"]
+        mappings_collection = db["mappings"]
         
-        # Create index for file names
+        # Create indexes for better performance
         await files_collection.create_index("file_name", unique=True)
+        
+        # Create index for mappings
+        await mappings_collection.create_index("mapping", unique=True)
+        await mappings_collection.create_index("message_id")
         
         logger.info("✅ MongoDB connected successfully")
     except Exception as e:
@@ -96,7 +136,6 @@ async def init_db():
         raise
 
 async def is_file_processed(file_name: str) -> bool:
-    """Check if file already processed (MongoDB)"""
     try:
         result = await files_collection.find_one({"file_name": file_name})
         return result is not None
@@ -105,18 +144,16 @@ async def is_file_processed(file_name: str) -> bool:
         return False
 
 async def save_file_info(file_name: str, file_size: str):
-    """Save only file name and size to MongoDB"""
     try:
         document = {
             "file_name": file_name,
             "file_size": file_size
         }
         await files_collection.insert_one(document)
-        logger.info(f"✅ Saved to MongoDB: {file_name}")
+        logger.info(f"✅ Saved to DB: {file_name}")
     except Exception as e:
-        logger.warning(f"Failed to save to MongoDB (might be duplicate): {e}")
+        logger.warning(f"Failed to save to DB (might be duplicate): {e}")
 
-# --- Worker API Functions for Mapping ---
 import random
 import string
 
@@ -125,49 +162,26 @@ def generate_random_mapping(length: int = 6) -> str:
     chars = string.ascii_letters + string.digits
     return ''.join(random.choice(chars) for _ in range(length))
 
-async def save_mapping_to_worker_api(message_id: int, session: aiohttp.ClientSession, max_retries: int = 3) -> Optional[str]:
-    """Save message_id with random mapping to Worker API"""
-    for attempt in range(max_retries):
+async def save_mapping(message_id: int) -> str:
+    """Save message_id with random mapping and return the mapping"""
+    max_attempts = 10
+    for attempt in range(max_attempts):
         try:
-            # Generate random mapping
             mapping = generate_random_mapping()
-            
-            # Prepare data for Worker API
-            data = {
-                "message_id": str(message_id),
-                "value": mapping
+            document = {
+                "mapping": mapping,
+                "message_id": message_id
             }
-            
-            # POST to Worker API
-            async with session.post(
-                f"{WORKER_DB_API}/add",
-                json=data,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    logger.info(f"✅ Saved to Worker API: {mapping} -> {message_id}")
-                    return mapping
-                elif response.status == 409:  # Conflict - duplicate mapping
-                    logger.warning(f"⚠️ Duplicate mapping, retrying... ({attempt + 1}/{max_retries})")
-                    continue
-                else:
-                    logger.error(f"❌ Worker API error: {response.status}")
-                    if attempt == max_retries - 1:
-                        return None
-                    
-        except asyncio.TimeoutError:
-            logger.warning(f"⏱️ Worker API timeout ({attempt + 1}/{max_retries})")
-            if attempt == max_retries - 1:
-                return None
+            await mappings_collection.insert_one(document)
+            logger.info(f"✅ Saved mapping: {mapping} -> {message_id}")
+            return mapping
         except Exception as e:
-            logger.error(f"❌ Worker API error: {e}")
-            if attempt == max_retries - 1:
-                return None
-        
-        await asyncio.sleep(1)
-    
-    return None
+            if attempt == max_attempts - 1:
+                logger.error(f"Failed to save mapping after {max_attempts} attempts: {e}")
+                raise
+            # Duplicate mapping, try again
+            continue
+    raise Exception("Failed to generate unique mapping")
 
 # ---------------- Aria2Client ----------------
 class Aria2Client:
@@ -335,72 +349,69 @@ class TeraboxTelegramBot:
         
         return {"success": False, "error": "Unknown error"}
 
-    async def upload_to_telegram_with_retry(self, context: ContextTypes.DEFAULT_TYPE, file_path: str, 
-                                           caption: str, mime_type: str, max_retries: int = 5):
-        """Upload to Telegram with flood wait handling"""
+    async def upload_to_telegram_pyrogram(self, file_path: str, caption: str, max_retries: int = 5):
+        """Upload to Telegram using Pyrogram (supports large files up to 2GB)"""
         for attempt in range(max_retries):
             try:
-                with open(file_path, "rb") as f:
-                    if mime_type and mime_type.startswith("video"):
-                        msg = await context.bot.send_video(
-                            chat_id=TELEGRAM_CHANNEL_ID, 
-                            video=f, 
-                            caption=caption,
-                            read_timeout=300,
-                            write_timeout=300,
-                            connect_timeout=60
-                        )
-                    elif mime_type and mime_type.startswith("image"):
-                        msg = await context.bot.send_photo(
-                            chat_id=TELEGRAM_CHANNEL_ID, 
-                            photo=f, 
-                            caption=caption,
-                            read_timeout=300,
-                            write_timeout=300,
-                            connect_timeout=60
-                        )
-                    else:
-                        msg = await context.bot.send_document(
-                            chat_id=TELEGRAM_CHANNEL_ID, 
-                            document=f, 
-                            caption=caption,
-                            read_timeout=300,
-                            write_timeout=300,
-                            connect_timeout=60
-                        )
+                # Determine file type based on mime type
+                mime_type, _ = mimetypes.guess_type(file_path)
+                
+                # Get file size for progress
+                file_size = os.path.getsize(file_path)
+                logger.info(f"📤 Uploading file: {os.path.basename(file_path)} ({file_size / (1024*1024):.2f} MB)")
+                
+                # Upload based on file type
+                if mime_type and mime_type.startswith("video"):
+                    msg = await pyrogram_client.send_video(
+                        chat_id=TELEGRAM_CHANNEL_ID,
+                        video=file_path,
+                        caption=caption,
+                        progress=self._upload_progress
+                    )
+                elif mime_type and mime_type.startswith("image"):
+                    msg = await pyrogram_client.send_photo(
+                        chat_id=TELEGRAM_CHANNEL_ID,
+                        photo=file_path,
+                        caption=caption,
+                        progress=self._upload_progress
+                    )
+                else:
+                    msg = await pyrogram_client.send_document(
+                        chat_id=TELEGRAM_CHANNEL_ID,
+                        document=file_path,
+                        caption=caption,
+                        progress=self._upload_progress
+                    )
                 
                 # Extract file_id
                 file_id = None
                 if msg.video:
                     file_id = msg.video.file_id
                 elif msg.photo:
-                    file_id = msg.photo[-1].file_id
+                    file_id = msg.photo.file_id
                 elif msg.document:
                     file_id = msg.document.file_id
                 
-                return {"success": True, "message_id": msg.message_id, "file_id": file_id}
-                    
-            except RetryAfter as e:
-                wait_time = e.retry_after + 2
+                logger.info(f"✅ Upload successful - Message ID: {msg.id}")
+                return {"success": True, "message_id": msg.id, "file_id": file_id}
+                
+            except FloodWait as e:
+                wait_time = e.value + 2
                 logger.warning(f"⏳ FloodWait: Waiting {wait_time}s")
                 await asyncio.sleep(wait_time)
-            except TimedOut as e:
-                logger.warning(f"⏱️ Timeout on upload attempt {attempt + 1}")
-                if attempt == max_retries - 1:
-                    return {"success": False, "error": f"Upload timeout: {str(e)}"}
-                await asyncio.sleep(5)
-            except NetworkError as e:
-                logger.warning(f"🌐 Network error: {str(e)}")
-                if attempt == max_retries - 1:
-                    return {"success": False, "error": f"Network error: {str(e)}"}
-                await asyncio.sleep(5)
             except Exception as e:
-                logger.error(f"❌ Upload error: {str(e)}")
+                logger.error(f"❌ Upload error (attempt {attempt + 1}): {str(e)}")
                 if attempt == max_retries - 1:
                     return {"success": False, "error": str(e)}
                 await asyncio.sleep(5)
         
-        return {"success": False, "error": "Upload failed"}
+        return {"success": False, "error": "Upload failed after retries"}
+    
+    def _upload_progress(self, current, total):
+        """Progress callback for Pyrogram upload"""
+        percentage = (current / total) * 100
+        if int(percentage) % 10 == 0:  # Log every 10%
+            logger.info(f"📤 Upload progress: {percentage:.1f}% ({current / (1024*1024):.2f} MB / {total / (1024*1024):.2f} MB)")
 
 # ---------------- Task Processing Functions ----------------
 bot_instance = TeraboxTelegramBot()
@@ -439,7 +450,7 @@ async def process_single_link(url: str, link_number: int, total_links: int,
         # Add watermark
         watermarked_name = bot_instance.add_watermark_to_filename(original_file_name)
         
-        # Check file size (50MB limit for stability)
+        # Check file size (increased limit for Pyrogram - 2GB default)
         try:
             size_val, size_unit = file_size_str.split()
             size_val = float(size_val)
@@ -454,8 +465,8 @@ async def process_single_link(url: str, link_number: int, total_links: int,
         except:
             size_mb = 0
 
-        if size_mb > 50:
-            error_msg = f"❌ File too large: {file_size_str} (max 50MB)"
+        if size_mb > MAX_FILE_SIZE_MB:
+            error_msg = f"❌ File too large: {file_size_str} (max {MAX_FILE_SIZE_MB}MB)"
             logger.info(error_msg)
             return False, None, error_msg
 
@@ -496,17 +507,14 @@ async def process_single_link(url: str, link_number: int, total_links: int,
         await status_msg.edit_text(
             f"🔄 Processing link {link_number}/{total_links}...\n"
             f"📦 {original_file_name}\n"
-            f"⬆️ Uploading to channel...",
+            f"⬆️ Uploading to channel (Pyrogram)...",
             parse_mode=ParseMode.HTML
         )
 
-        # Step 3: Upload to Telegram
+        # Step 3: Upload to Telegram using Pyrogram (supports large files)
         caption_file = f"📁 File Name: {watermarked_name}\n📊 File Size: {file_size_str}"
-        mime_type, _ = mimetypes.guess_type(fpath)
         
-        upload_result = await bot_instance.upload_to_telegram_with_retry(
-            context, fpath, caption_file, mime_type
-        )
+        upload_result = await bot_instance.upload_to_telegram_pyrogram(fpath, caption_file)
         
         if not upload_result["success"]:
             error_msg = f"❌ Upload failed: {upload_result['error']}"
@@ -522,17 +530,11 @@ async def process_single_link(url: str, link_number: int, total_links: int,
         
         logger.info(f"✅ Uploaded - Msg ID: {message_id}")
 
-        # Step 4: Save to MongoDB (only file_name and file_size)
+        # Step 4: Save to DB (only file_name and file_size)
         await save_file_info(original_file_name, file_size_str)
 
-        # Step 5: Save mapping to Worker API
-        await bot_instance.init_session()
-        mapping = await save_mapping_to_worker_api(message_id, bot_instance.session)
-        
-        if not mapping:
-            logger.error(f"❌ Failed to save mapping to Worker API")
-            error_msg = f"❌ Failed to save mapping"
-            return False, None, error_msg
+        # Generate mapping and save to DB
+        mapping = await save_mapping(message_id)
         
         # Build worker URL
         worker_url = f"{WORKER_URL_BASE}/{mapping}"
@@ -699,9 +701,14 @@ async def process_task(urls: List[str], context: ContextTypes.DEFAULT_TYPE,
                 pass
 
 async def handle_media_with_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming media with links - ADD TO QUEUE"""
+    """Handle incoming media with links - ADD TO QUEUE (Ignore only configured channels)"""
     m = update.effective_message
     if not m:
+        return
+
+    # IGNORE ONLY CONFIGURED CHANNELS (TELEGRAM_CHANNEL_ID and RESULT_CHANNEL_ID)
+    if m.chat.id == TELEGRAM_CHANNEL_ID or m.chat.id == RESULT_CHANNEL_ID:
+        logger.info(f"⏭️ Ignoring post from configured channel: {m.chat.id}")
         return
 
     try:
@@ -744,12 +751,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await m.reply_text(
         f"✅ <b>Bot is Running!</b>\n\n"
         f"📌 <b>Features:</b>\n"
+        f"• <b>Pyrogram integration</b> - Upload files up to {MAX_FILE_SIZE_MB}MB!\n"
         f"• One-by-one processing (no overload)\n"
         f"• Global queue system\n"
         f"• Automatic file renaming with watermark\n"
-        f"• MongoDB storage for file info\n"
-        f"• Worker API for message mappings\n"
-        f"• Flood wait handling\n\n"
+        f"• MongoDB storage for duplicate detection\n"
+        f"• Flood wait handling\n"
+        f"• Ignores configured channels\n\n"
         f"📋 <b>How to use:</b>\n"
         f"Send media (photo/video/document) with Terabox links in caption.\n\n"
         f"💡 <b>Example:</b>\n"
@@ -782,6 +790,9 @@ async def start_webhook_server():
     
     # Initialize database
     await init_db()
+    
+    # Initialize Pyrogram
+    await init_pyrogram()
     
     # Create application
     application = (
@@ -829,8 +840,9 @@ async def start_webhook_server():
     logger.info(f"📢 Telegram Channel: {TELEGRAM_CHANNEL_ID}")
     logger.info(f"📊 Result Channel: {RESULT_CHANNEL_ID}")
     logger.info(f"🏷️ Watermark: {CHANNEL_USERNAME}")
-    logger.info(f"🔗 Worker DB API: {WORKER_DB_API}")
     logger.info(f"📋 Global queue system active")
+    logger.info(f"⏭️ Ignoring channels: {TELEGRAM_CHANNEL_ID}, {RESULT_CHANNEL_ID}")
+    logger.info(f"📤 Pyrogram enabled - Max file size: {MAX_FILE_SIZE_MB}MB")
 
     # Keep the server running
     await asyncio.Event().wait()
@@ -845,6 +857,9 @@ def main():
         
         async def run_polling():
             await init_db()
+            
+            # Initialize Pyrogram
+            await init_pyrogram()
             
             app = (
                 Application.builder()
@@ -865,8 +880,9 @@ def main():
             logger.info("🚀 Bot started in polling mode")
             logger.info(f"📢 Telegram Channel: {TELEGRAM_CHANNEL_ID}")
             logger.info(f"📊 Result Channel: {RESULT_CHANNEL_ID}")
-            logger.info(f"🔗 Worker DB API: {WORKER_DB_API}")
             logger.info(f"📋 Global queue system active")
+            logger.info(f"⏭️ Ignoring channels: {TELEGRAM_CHANNEL_ID}, {RESULT_CHANNEL_ID}")
+            logger.info(f"📤 Pyrogram enabled - Max file size: {MAX_FILE_SIZE_MB}MB")
             
             await app.run_polling()
         
