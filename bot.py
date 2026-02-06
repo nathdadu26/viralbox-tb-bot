@@ -60,10 +60,16 @@ CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@Mid_Night_Hub")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 PORT = int(os.getenv("PORT", "8000"))
 
-# Aria2 Configuration
+# Aria2 Configuration - IMPROVED
 ARIA2_RPC_URL = os.getenv("ARIA2_RPC_URL", "http://localhost:6800/jsonrpc")
-ARIA2_SECRET = os.getenv("ARIA2_SECRET", "mysecret")
+ARIA2_SECRET = os.getenv("ARIA2_SECRET", "")  # Now required!
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/aria2_downloads")
+
+# Validate Aria2 Secret
+if not ARIA2_SECRET:
+    import secrets
+    ARIA2_SECRET = secrets.token_urlsafe(32)
+    logger.warning(f"⚠️ ARIA2_SECRET not set! Generated random secret: {ARIA2_SECRET}")
 
 # Terabox domains
 TERABOX_DOMAINS = [
@@ -77,6 +83,9 @@ API_TIMEOUT = int(os.getenv("API_TIMEOUT", "120"))
 
 # File size limit (2GB for Pyrogram)
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "2000"))  # 2GB default
+
+# Download progress update interval (seconds)
+PROGRESS_UPDATE_INTERVAL = 10
 
 # Validate required environment variables
 if not BOT_TOKEN:
@@ -110,8 +119,11 @@ async def init_pyrogram():
 async def stop_pyrogram():
     global pyrogram_client
     if pyrogram_client:
-        await pyrogram_client.stop()
-        logger.info("🛑 Pyrogram client stopped")
+        try:
+            await pyrogram_client.stop()
+            logger.info("🛑 Pyrogram client stopped")
+        except Exception as e:
+            logger.error(f"Error stopping Pyrogram: {e}")
 
 # --- MongoDB Database Setup ---
 mongo_client = None
@@ -138,6 +150,15 @@ async def init_db():
     except Exception as e:
         logger.error(f"❌ MongoDB connection failed: {e}")
         raise
+
+async def close_db():
+    global mongo_client
+    if mongo_client:
+        try:
+            mongo_client.close()
+            logger.info("🛑 MongoDB connection closed")
+        except Exception as e:
+            logger.error(f"Error closing MongoDB: {e}")
 
 async def is_file_processed(file_name: str) -> bool:
     try:
@@ -187,9 +208,9 @@ async def save_mapping(message_id: int) -> str:
             continue
     raise Exception("Failed to generate unique mapping")
 
-# ---------------- Aria2Client ----------------
+# ---------------- Aria2Client - IMPROVED ----------------
 class Aria2Client:
-    def __init__(self, rpc_url: str, secret: Optional[str] = None):
+    def __init__(self, rpc_url: str, secret: str):
         self.rpc_url = rpc_url
         self.secret = secret
         self.session: Optional[aiohttp.ClientSession] = None
@@ -197,13 +218,18 @@ class Aria2Client:
     async def init_session(self):
         if not self.session:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600))
+            logger.info("✅ Aria2 RPC session initialized")
 
     async def close_session(self):
         if self.session:
-            await self.session.close()
-            self.session = None
+            try:
+                await self.session.close()
+                self.session = None
+                logger.info("🛑 Aria2 RPC session closed")
+            except Exception as e:
+                logger.error(f"Error closing Aria2 session: {e}")
 
-    async def _call_rpc(self, method: str, params: list = None):
+    async def _call_rpc(self, method: str, params: list = None) -> Dict[str, Any]:
         if params is None:
             params = []
         if self.secret:
@@ -217,25 +243,85 @@ class Aria2Client:
                     return {"success": False, "error": result["error"]}
                 return {"success": True, "result": result.get("result")}
         except Exception as e:
+            logger.error(f"Aria2 RPC call failed: {method} - {e}")
             return {"success": False, "error": str(e)}
 
-    async def add_download(self, url: str, options: Dict[str, Any] = None):
+    async def add_download(self, url: str, options: Dict[str, Any] = None) -> Dict[str, Any]:
         if options is None:
             options = {}
-        opts = {"dir": DOWNLOAD_DIR, "continue": "true"}
+        # OPTIMIZED ARIA2 OPTIONS FOR FASTER DOWNLOADS
+        opts = {
+            "dir": DOWNLOAD_DIR,
+            "continue": "true",
+            "max-connection-per-server": "16",  # Increased from 10
+            "split": "16",  # Increased from 10
+            "min-split-size": "1M",
+            "max-concurrent-downloads": "5",
+            "max-download-limit": "0",  # No limit
+            "lowest-speed-limit": "0",
+            "disable-ipv6": "true",
+            "connect-timeout": "30",
+            "timeout": "30",
+            "max-tries": "5",
+            "retry-wait": "3",
+        }
         opts.update(options)
         return await self._call_rpc("aria2.addUri", [[url], opts])
 
-    async def wait_for_download(self, gid: str):
+    async def get_status(self, gid: str) -> Dict[str, Any]:
+        """Get download status with progress info"""
+        result = await self._call_rpc("aria2.tellStatus", [gid, ["status", "totalLength", "completedLength", "downloadSpeed", "errorMessage"]])
+        return result
+
+    async def wait_for_download(self, gid: str, status_msg=None, link_number: int = 1, total_links: int = 1, file_name: str = ""):
+        """Wait for download with progress updates"""
+        last_update = 0
+        
         while True:
-            status = await self._call_rpc("aria2.tellStatus", [gid])
+            status = await self.get_status(gid)
             if not status["success"]:
                 return status
+            
             info = status["result"]
-            if info["status"] == "complete":
-                return {"success": True, "files": info["files"]}
-            elif info["status"] in ["error", "removed"]:
-                return {"success": False, "error": info.get("errorMessage", "Download failed")}
+            current_status = info.get("status", "")
+            
+            if current_status == "complete":
+                files_result = await self._call_rpc("aria2.getFiles", [gid])
+                if files_result["success"]:
+                    return {"success": True, "files": files_result["result"]}
+                return {"success": False, "error": "Failed to get file info"}
+                
+            elif current_status in ["error", "removed"]:
+                error_msg = info.get("errorMessage", "Download failed")
+                return {"success": False, "error": error_msg}
+            
+            # Update progress every PROGRESS_UPDATE_INTERVAL seconds
+            current_time = time.time()
+            if status_msg and (current_time - last_update) >= PROGRESS_UPDATE_INTERVAL:
+                try:
+                    total = int(info.get("totalLength", 0))
+                    completed = int(info.get("completedLength", 0))
+                    speed = int(info.get("downloadSpeed", 0))
+                    
+                    if total > 0:
+                        percent = (completed / total) * 100
+                        speed_mb = speed / (1024 * 1024)
+                        
+                        # Format file name for display (decode URL encoding)
+                        display_name = urllib.parse.unquote(file_name)
+                        
+                        await status_msg.edit_text(
+                            f"🔄 Processing link {link_number}/{total_links}...\n"
+                            f"📦 {display_name}\n"
+                            f"⬇️ Downloading...\n"
+                            f"⬇️ GID: {gid[:8]}... | {percent:.1f}%\n"
+                            f"⚡ Speed: {speed_mb:.2f} MB/s",
+                            parse_mode=ParseMode.HTML
+                        )
+                        last_update = current_time
+                except Exception as e:
+                    logger.warning(f"Failed to update progress: {e}")
+            
             await asyncio.sleep(2)
 
 # ---------------- Global Task Queue ----------------
@@ -251,6 +337,15 @@ class GlobalTaskQueue:
             self.worker_task = asyncio.create_task(self._worker())
             logger.info("🚀 Global task queue worker started")
     
+    async def stop_worker(self):
+        """Stop the background worker"""
+        if self.worker_task and not self.worker_task.done():
+            self.worker_task.cancel()
+            try:
+                await self.worker_task
+            except asyncio.CancelledError:
+                logger.info("🛑 Queue worker stopped")
+    
     async def _worker(self):
         """Background worker that processes queue items one by one"""
         while True:
@@ -262,7 +357,10 @@ class GlobalTaskQueue:
                 logger.info(f"📋 Queue size: {self.queue.qsize()} | Processing new task")
                 
                 # Process the task
-                await task["func"](**task["kwargs"])
+                try:
+                    await task["func"](**task["kwargs"])
+                except Exception as e:
+                    logger.error(f"Task execution failed: {e}", exc_info=True)
                 
                 # Mark task as done
                 self.queue.task_done()
@@ -271,8 +369,11 @@ class GlobalTaskQueue:
                 # Small delay between tasks
                 await asyncio.sleep(1)
                 
+            except asyncio.CancelledError:
+                logger.info("Queue worker cancelled")
+                break
             except Exception as e:
-                logger.error(f"❌ Error in queue worker: {e}")
+                logger.error(f"❌ Error in queue worker: {e}", exc_info=True)
                 self.processing = False
     
     async def add_task(self, func, **kwargs):
@@ -295,19 +396,29 @@ class TeraboxTelegramBot:
             # Increased timeout for slow Terabox API
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
 
+    async def close_session(self):
+        if self.session:
+            try:
+                await self.session.close()
+                self.session = None
+                logger.info("🛑 Bot HTTP session closed")
+            except Exception as e:
+                logger.error(f"Error closing bot session: {e}")
+
     def is_terabox_url(self, url: str) -> bool:
         try:
             domain = urllib.parse.urlparse(url).netloc.lower().removeprefix("www.")
             return domain in TERABOX_DOMAINS or any(d in domain for d in TERABOX_DOMAINS)
-        except:
+        except Exception as e:
+            logger.error(f"Error parsing URL: {e}")
             return False
 
     def add_watermark_to_filename(self, original_name: str) -> str:
-        """Add 'Telegram - @hive_zone' before the original filename"""
+        """Add watermark before the original filename"""
         name, ext = os.path.splitext(original_name)
         return f"Telegram - {CHANNEL_USERNAME} {name}{ext}"
 
-    async def download_from_terabox(self, url: str, max_retries: int = 3):
+    async def download_from_terabox(self, url: str, max_retries: int = 3) -> Dict[str, Any]:
         """Download from Terabox with retry logic and proper timeout handling"""
         await self.init_session()
         
@@ -353,7 +464,7 @@ class TeraboxTelegramBot:
         
         return {"success": False, "error": "Unknown error"}
 
-    async def upload_to_telegram_pyrogram(self, file_path: str, caption: str, max_retries: int = 5):
+    async def upload_to_telegram_pyrogram(self, file_path: str, caption: str, max_retries: int = 5) -> Dict[str, Any]:
         """Upload to Telegram using Pyrogram (supports large files up to 2GB)"""
         for attempt in range(max_retries):
             try:
@@ -422,111 +533,104 @@ bot_instance = TeraboxTelegramBot()
 
 async def process_single_link(url: str, link_number: int, total_links: int, 
                               context: ContextTypes.DEFAULT_TYPE, status_msg) -> Tuple[bool, Optional[Dict], Optional[str]]:
-    """Process a single link"""
+    """Process a single link with improved error handling"""
+    file_path = None
     try:
+        # Step 1: Get file info
         await status_msg.edit_text(
             f"🔄 Processing link {link_number}/{total_links}...\n"
-            f"⏳ Fetching Terabox info...",
+            f"🔍 Fetching file info...",
             parse_mode=ParseMode.HTML
         )
-        
-        # Step 1: Get Terabox info
-        logger.info(f"[{link_number}/{total_links}] Getting Terabox info")
-        tb = await bot_instance.download_from_terabox(url)
-        
-        if not tb["success"]:
-            error_msg = f"❌ Terabox API failed: {tb['error']}"
+
+        result = await bot_instance.download_from_terabox(url)
+        if not result["success"]:
+            error_msg = f"❌ API Error: {result['error']}"
             logger.error(error_msg)
             return False, None, error_msg
 
-        data = tb["data"]
-        original_file_name = data.get("file_name", "unknown")
-        file_size_str = data.get("file_size", "0")
+        data = result["data"]
+        original_file_name = data.get("file_name", "unknown_file")
+        file_size_str = data.get("file_size", "Unknown")
         
-        logger.info(f"[{link_number}/{total_links}] File: {original_file_name}")
+        # Decode filename if URL encoded
+        try:
+            original_file_name = urllib.parse.unquote(original_file_name)
+        except Exception:
+            pass
+
+        watermarked_name = bot_instance.add_watermark_to_filename(original_file_name)
 
         # Check if already processed
         if await is_file_processed(original_file_name):
-            error_msg = f"⚠️ Already processed: {original_file_name}"
-            logger.info(error_msg)
-            return False, None, error_msg
+            logger.info(f"⏭️ Skipping duplicate: {original_file_name}")
+            return False, None, f"⏭️ Already processed"
 
-        # Add watermark
-        watermarked_name = bot_instance.add_watermark_to_filename(original_file_name)
-        
-        # Check file size (increased limit for Pyrogram - 2GB default)
+        # Parse file size and check limit
         try:
-            size_val, size_unit = file_size_str.split()
-            size_val = float(size_val)
-            if size_unit.lower().startswith("kb"):
-                size_mb = size_val / 1024
-            elif size_unit.lower().startswith("mb"):
-                size_mb = size_val
-            elif size_unit.lower().startswith("gb"):
-                size_mb = size_val * 1024
-            else:
-                size_mb = 0
-        except:
             size_mb = 0
+            if "MB" in file_size_str:
+                size_mb = float(file_size_str.replace("MB", "").strip())
+            elif "GB" in file_size_str:
+                size_mb = float(file_size_str.replace("GB", "").strip()) * 1024
+            
+            if size_mb > MAX_FILE_SIZE_MB:
+                error_msg = f"❌ File too large: {file_size_str} (max {MAX_FILE_SIZE_MB}MB)"
+                logger.info(error_msg)
+                return False, None, error_msg
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Could not parse file size: {file_size_str} - {e}")
 
-        if size_mb > MAX_FILE_SIZE_MB:
-            error_msg = f"❌ File too large: {file_size_str} (max {MAX_FILE_SIZE_MB}MB)"
-            logger.info(error_msg)
-            return False, None, error_msg
-
-        await status_msg.edit_text(
-            f"🔄 Processing link {link_number}/{total_links}...\n"
-            f"📦 {original_file_name}\n"
-            f"⬇️ Downloading...",
-            parse_mode=ParseMode.HTML
-        )
-
-        # Step 2: Download
+        # Step 2: Download with progress
         dl_url = data.get("streaming_url") or data.get("download_link")
         if not dl_url:
-            error_msg = f"❌ No download link"
+            error_msg = f"❌ No download link available"
             logger.error(error_msg)
             return False, None, error_msg
 
-        logger.info(f"📥 Starting download")
+        logger.info(f"📥 Starting download: {original_file_name}")
         dl = await bot_instance.aria2.add_download(dl_url, {"out": watermarked_name})
         
         if not dl["success"]:
-            error_msg = f"❌ Download failed: {dl['error']}"
+            error_msg = f"❌ Download init failed: {dl.get('error', 'Unknown')}"
             logger.error(error_msg)
             return False, None, error_msg
 
         gid = dl["result"]
-        logger.info(f"✅ Download started: {gid}")
+        logger.info(f"✅ Download started: GID {gid}")
         
-        done = await bot_instance.aria2.wait_for_download(gid)
+        # Wait for download with progress updates
+        done = await bot_instance.aria2.wait_for_download(
+            gid, 
+            status_msg=status_msg, 
+            link_number=link_number, 
+            total_links=total_links,
+            file_name=original_file_name
+        )
+        
         if not done["success"]:
-            error_msg = f"❌ Download error: {done['error']}"
+            error_msg = f"❌ Download failed: {done.get('error', 'Unknown')}"
             logger.error(error_msg)
             return False, None, error_msg
 
-        fpath = done["files"][0]["path"]
-        logger.info(f"✅ Downloaded: {fpath}")
+        file_path = done["files"][0]["path"]
+        logger.info(f"✅ Downloaded: {file_path}")
 
+        # Step 3: Upload to Telegram
         await status_msg.edit_text(
             f"🔄 Processing link {link_number}/{total_links}...\n"
             f"📦 {original_file_name}\n"
-            f"⬆️ Uploading to channel (Pyrogram)...",
+            f"⬆️ Uploading to channel...",
             parse_mode=ParseMode.HTML
         )
 
-        # Step 3: Upload to Telegram using Pyrogram (supports large files)
         caption_file = f"📁 File Name: {watermarked_name}\n📊 File Size: {file_size_str}"
         
-        upload_result = await bot_instance.upload_to_telegram_pyrogram(fpath, caption_file)
+        upload_result = await bot_instance.upload_to_telegram_pyrogram(file_path, caption_file)
         
         if not upload_result["success"]:
-            error_msg = f"❌ Upload failed: {upload_result['error']}"
+            error_msg = f"❌ Upload failed: {upload_result.get('error', 'Unknown')}"
             logger.error(error_msg)
-            try:
-                os.remove(fpath)
-            except:
-                pass
             return False, None, error_msg
 
         message_id = upload_result["message_id"]
@@ -534,7 +638,7 @@ async def process_single_link(url: str, link_number: int, total_links: int,
         
         logger.info(f"✅ Uploaded - Msg ID: {message_id}")
 
-        # Step 4: Save to DB (only file_name and file_size)
+        # Step 4: Save to DB
         await save_file_info(original_file_name, file_size_str)
 
         # Generate mapping and save to DB
@@ -554,20 +658,22 @@ async def process_single_link(url: str, link_number: int, total_links: int,
             "worker_url": worker_url
         }
 
-        # Cleanup
-        try:
-            os.remove(fpath)
-            logger.info(f"🗑️ Deleted: {fpath}")
-        except Exception as e:
-            logger.warning(f"Failed to delete: {e}")
-
         logger.info(f"[{link_number}/{total_links}] ✅ Success: {original_file_name}")
         return True, result_data, None
 
     except Exception as e:
         error_msg = f"❌ Unexpected error: {str(e)}"
-        logger.error(f"Error: {str(e)}")
+        logger.error(f"Error processing link: {str(e)}", exc_info=True)
         return False, None, error_msg
+    
+    finally:
+        # Cleanup downloaded file
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info(f"🗑️ Deleted: {file_path}")
+            except Exception as e:
+                logger.warning(f"Failed to delete file: {e}")
 
 async def process_task(urls: List[str], context: ContextTypes.DEFAULT_TYPE, 
                       message_id: int, chat_id: int, user_message_id: int, user_media_message):
@@ -592,7 +698,6 @@ async def process_task(urls: List[str], context: ContextTypes.DEFAULT_TYPE,
         for idx, url in enumerate(urls, 1):
             logger.info(f"▶️ Processing link {idx}/{total_links}")
             
-            # Pass reply_msg as status_msg parameter
             success, result_data, error_msg = await process_single_link(
                 url, idx, total_links, context, reply_msg
             )
@@ -614,7 +719,6 @@ async def process_task(urls: List[str], context: ContextTypes.DEFAULT_TYPE,
                 for result in successful_results:
                     result_caption += f"✅ {result['worker_url']}\n"
                 
-                # Remove trailing newline
                 result_caption = result_caption.strip()
                 
                 # Copy user's media message to result channel with worker URLs
@@ -628,7 +732,7 @@ async def process_task(urls: List[str], context: ContextTypes.DEFAULT_TYPE,
                 logger.info(f"✅ Posted {len(successful_results)} successful results to result channel")
                 
             except Exception as e:
-                logger.error(f"Failed to copy to result channel: {e}")
+                logger.error(f"Failed to copy to result channel: {e}", exc_info=True)
 
         # Update reply message with final status
         if failed_links and successful_results:
@@ -641,8 +745,8 @@ async def process_task(urls: List[str], context: ContextTypes.DEFAULT_TYPE,
             
             try:
                 await reply_msg.edit_text(final_msg, parse_mode=ParseMode.HTML)
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to update message: {e}")
             
             logger.warning(f"⚠️ Task completed: {len(successful_results)} success, {len(failed_links)} failed")
             
@@ -660,8 +764,8 @@ async def process_task(urls: List[str], context: ContextTypes.DEFAULT_TYPE,
             
             try:
                 await reply_msg.edit_text(error_summary, parse_mode=ParseMode.HTML)
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to update message: {e}")
             
             logger.warning(f"❌ Task failed: All {len(failed_links)} links failed")
             return
@@ -674,8 +778,8 @@ async def process_task(urls: List[str], context: ContextTypes.DEFAULT_TYPE,
                     parse_mode=ParseMode.HTML
                 )
                 await asyncio.sleep(2)
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to update message: {e}")
             
             # Delete both messages on complete success
             try:
@@ -693,7 +797,7 @@ async def process_task(urls: List[str], context: ContextTypes.DEFAULT_TYPE,
             logger.info(f"✅ Task completed successfully: {len(successful_results)} files processed")
 
     except Exception as e:
-        logger.error(f"❌ Error in process_task: {e}")
+        logger.error(f"❌ Error in process_task: {e}", exc_info=True)
         # On unexpected error, show error and keep messages
         if reply_msg:
             try:
@@ -701,8 +805,8 @@ async def process_task(urls: List[str], context: ContextTypes.DEFAULT_TYPE,
                     f"❌ <b>Unexpected Error</b>\n\n{str(e)}",
                     parse_mode=ParseMode.HTML
                 )
-            except:
-                pass
+            except Exception as edit_error:
+                logger.error(f"Failed to update error message: {edit_error}")
 
 async def handle_media_with_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming media with links - ADD TO QUEUE (Ignore only configured channels)"""
@@ -726,7 +830,7 @@ async def handle_media_with_links(update: Update, context: ContextTypes.DEFAULT_
         terabox_links = [u for u in urls if bot_instance.is_terabox_url(u)]
 
         if not terabox_links:
-            err_msg = await m.reply_text(
+            await m.reply_text(
                 "❌ No Terabox links found.",
                 parse_mode=ParseMode.HTML
             )
@@ -746,7 +850,7 @@ async def handle_media_with_links(update: Update, context: ContextTypes.DEFAULT_
         )
 
     except Exception as e:
-        logger.error(f"Error in handle_media_with_links: {e}")
+        logger.error(f"Error in handle_media_with_links: {e}", exc_info=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
@@ -761,7 +865,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Automatic file renaming with watermark\n"
         f"• MongoDB storage for duplicate detection\n"
         f"• Flood wait handling\n"
-        f"• Ignores configured channels\n\n"
+        f"• Ignores configured channels\n"
+        f"• Optimized Aria2 downloads (16 connections)\n"
+        f"• Real-time progress updates\n\n"
         f"📋 <b>How to use:</b>\n"
         f"Send media (photo/video/document) with Terabox links in caption.\n\n"
         f"💡 <b>Example:</b>\n"
@@ -782,11 +888,36 @@ async def webhook_handler(request):
         await application.process_update(update)
         return web.Response(status=200)
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {e}", exc_info=True)
         return web.Response(status=500)
 
 # Global application instance
 application = None
+
+# CLEANUP HANDLER - NEW!
+async def shutdown_handler(app: Application):
+    """Cleanup on shutdown"""
+    logger.info("🛑 Starting shutdown sequence...")
+    
+    try:
+        # Stop queue worker
+        await global_queue.stop_worker()
+        
+        # Close Aria2 session
+        await bot_instance.aria2.close_session()
+        
+        # Close bot session
+        await bot_instance.close_session()
+        
+        # Close MongoDB
+        await close_db()
+        
+        # Stop Pyrogram
+        await stop_pyrogram()
+        
+        logger.info("✅ Shutdown complete")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}", exc_info=True)
 
 async def start_webhook_server():
     """Start the webhook server"""
@@ -797,6 +928,9 @@ async def start_webhook_server():
     
     # Initialize Pyrogram
     await init_pyrogram()
+    
+    # Initialize Aria2 session
+    await bot_instance.aria2.init_session()
     
     # Create application
     application = (
@@ -811,6 +945,9 @@ async def start_webhook_server():
         filters.PHOTO | filters.VIDEO | filters.Document.ALL,
         handle_media_with_links
     ))
+
+    # Add shutdown handler
+    application.post_shutdown = shutdown_handler
 
     # Initialize the application
     await application.initialize()
@@ -847,6 +984,8 @@ async def start_webhook_server():
     logger.info(f"📋 Global queue system active")
     logger.info(f"⏭️ Ignoring channels: {TELEGRAM_CHANNEL_ID}, {RESULT_CHANNEL_ID}")
     logger.info(f"📤 Pyrogram enabled - Max file size: {MAX_FILE_SIZE_MB}MB")
+    logger.info(f"🔐 Aria2 RPC secured with secret")
+    logger.info(f"⚡ Aria2 optimized: 16 connections per server")
 
     # Keep the server running
     await asyncio.Event().wait()
@@ -860,23 +999,31 @@ def main():
         logger.info("Starting in POLLING mode")
         
         async def run_polling():
+            global application
+            
             await init_db()
             
             # Initialize Pyrogram
             await init_pyrogram()
             
-            app = (
+            # Initialize Aria2 session
+            await bot_instance.aria2.init_session()
+            
+            application = (
                 Application.builder()
                 .token(BOT_TOKEN)
                 .defaults(Defaults(parse_mode=ParseMode.HTML))
                 .build()
             )
 
-            app.add_handler(CommandHandler("start", start))
-            app.add_handler(MessageHandler(
+            application.add_handler(CommandHandler("start", start))
+            application.add_handler(MessageHandler(
                 filters.PHOTO | filters.VIDEO | filters.Document.ALL,
                 handle_media_with_links
             ))
+            
+            # Add shutdown handler
+            application.post_shutdown = shutdown_handler
             
             # Start global queue worker
             await global_queue.start_worker()
@@ -887,8 +1034,10 @@ def main():
             logger.info(f"📋 Global queue system active")
             logger.info(f"⏭️ Ignoring channels: {TELEGRAM_CHANNEL_ID}, {RESULT_CHANNEL_ID}")
             logger.info(f"📤 Pyrogram enabled - Max file size: {MAX_FILE_SIZE_MB}MB")
+            logger.info(f"🔐 Aria2 RPC secured with secret")
+            logger.info(f"⚡ Aria2 optimized: 16 connections per server")
             
-            await app.run_polling()
+            await application.run_polling()
         
         asyncio.run(run_polling())
 
