@@ -956,12 +956,27 @@ async def start_webhook_server():
     # Start global queue worker
     await global_queue.start_worker()
 
-    # Set webhook
+    # Set webhook (only if not already set correctly)
     if WEBHOOK_URL:
         webhook_path = f"/webhook/{BOT_TOKEN}"
         full_webhook_url = f"{WEBHOOK_URL}{webhook_path}"
-        await application.bot.set_webhook(url=full_webhook_url)
-        logger.info(f"Webhook set to: {full_webhook_url}")
+        
+        try:
+            # Check current webhook
+            webhook_info = await application.bot.get_webhook_info()
+            current_webhook = webhook_info.url
+            
+            if current_webhook == full_webhook_url:
+                logger.info(f"✅ Webhook already set correctly: {full_webhook_url}")
+            else:
+                # Set new webhook
+                await application.bot.set_webhook(url=full_webhook_url)
+                logger.info(f"🔄 Webhook updated to: {full_webhook_url}")
+        except Exception as e:
+            logger.error(f"❌ Webhook setup error: {e}")
+            # Try setting webhook anyway
+            await application.bot.set_webhook(url=full_webhook_url)
+            logger.info(f"🔄 Webhook set to: {full_webhook_url}")
     else:
         logger.warning("WEBHOOK_URL not set!")
 
